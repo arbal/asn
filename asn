@@ -12,7 +12,7 @@
 # │ (Launch the script without parameters or visit the project's homepage for usage info)│
 # ╰──────────────────────────────────────────────────────────────────────────────────────╯
 
-ASN_VERSION="0.72.6"
+ASN_VERSION="0.73.3"
 
 # ╭──────────────────╮
 # │ Helper functions │
@@ -176,7 +176,7 @@ QueryRipestat(){
 	ipv6_ripe_prefixes_count=$(wc -l <<<"$ipv6_ripe_prefixes")
 
 	# open persistent tcp connection to RIPE whois server
-	exec 3<>/dev/tcp/whois.ripe.net/43
+	exec 6<>/dev/tcp/whois.ripe.net/43
 
 	prefixcounter=0
 	for prefix in $ipv6_ripe_prefixes; do
@@ -186,24 +186,24 @@ QueryRipestat(){
 		# inet6nums=$(whois -h whois.ripe.net -- "-T inet6num -K -L --resource $prefix" | \
 		#				grep -m2 inet6num | cut -d ':' -f 2- | sed 's/^[ \t]*//')
 		# new way (direct tcp connection to whois server with persistent whois connection)
-		echo -e "-k -T inet6num -K -L --resource $prefix" >&3
+		echo -e "-k -T inet6num -K -L --resource $prefix" >&6
 		whoisoutput=""
 		# read whois output from the tcp stream line by line
-		while IFS= read -r -u 3 whoisoutputline; do
+		while IFS= read -r -u 6 whoisoutputline; do
 			if [ -n "$whoisoutputline" ]; then
 				whoisoutput+="$whoisoutputline\n"
 				continue
 			fi
 			# last line was empty, check if next line is empty too
 			# if we get two empty lines in a row, the whois output is finished
-			IFS= read -r -u 3 whoisoutputline
+			IFS= read -r -u 6 whoisoutputline
 			[[ -z "$whoisoutputline" ]] && break || whoisoutput+="$whoisoutputline\n"
 		done
 		inet6nums=$(echo -e "$whoisoutput" | grep -m2 inet6num | cut -d ':' -f 2- | sed 's/^[ \t]*//')
 		for inet6num in $inet6nums; do
 			# exclude RIR supernets
 			prefix_size=$(echo "$inet6num" | cut -d '/' -f 2)
-			[[ "$prefix_size" -lt 29 ]] && continue || ipv6_inetnums+="${inet6num}\n"
+			[[ "$prefix_size" -le 12 ]] && continue || ipv6_inetnums+="${inet6num}\n"
 		done
 	done
 
@@ -215,17 +215,17 @@ QueryRipestat(){
 		# parent_inetnum=$(whois -h whois.ripe.net -- "-T inetnum -K -L --resource  $prefix" | \
 		# 				grep -E -m1 "^inetnum" | awk '{print $2"-"$4}' | xargs ipcalc -r 2>/dev/null | grep -v "deaggregate")
 		# new way (direct tcp connection to whois server with persistent whois connection)
-		echo -e "-k -T inetnum -K -L --resource $prefix" >&3
+		echo -e "-k -T inetnum -K -L --resource $prefix" >&6
 		whoisoutput=""
 		# read whois output from the tcp stream line by line
-		while IFS= read -r -u 3 whoisoutputline; do
+		while IFS= read -r -u 6 whoisoutputline; do
 			if [ -n "$whoisoutputline" ]; then
 				whoisoutput+="$whoisoutputline\n"
 				continue
 			fi
 			# last line was empty, check if next line is empty too
 			# if we get two empty lines in a row, the whois output is finished
-			IFS= read -r -u 3 whoisoutputline
+			IFS= read -r -u 6 whoisoutputline
 			[[ -z "$whoisoutputline" ]] && break || whoisoutput+="$whoisoutputline\n"
 		done
 		parent_inetnum=$(echo -e "$whoisoutput" | grep -E -m1 "^inetnum")
@@ -247,8 +247,8 @@ QueryRipestat(){
 		fi
 	done
 	# close persistent tcp connection to RIPE whois server
-	if { true >&3; } 2<> /dev/null; then
-		echo -e "-k" >&3
+	if { true >&6; } 2<> /dev/null; then
+		echo -e "-k" >&6
 	fi
 
 	# fetch further inetnums allocated to this AS from pWhois
@@ -369,6 +369,10 @@ WhoisIP(){
 	[[ "$#" -gt 1 ]] && GENERIC_WHOIS_LOOKUP_ONLY=true
 	full_whois_data=$(timeout 5 whois "$1" 2>/dev/null)
 	network_whois_data=$(echo -e "$full_whois_data" | grep -i -E "^netname:|^orgname:|^org-name:|^owner:|^descr:|^country:")
+	# fetch whois inetnum and later compare to cymru prefix, in order to find smallest match (sometimes whois and cymru/pwhois prefix data diverge)
+	whois_inetnum=$(IpcalcDeaggregate "$(grep -E -m1 "inet[6]?num|NetRange"<<<"$full_whois_data" | awk '{print $2 $3 $4}')")
+	# handle problematic IPs where whois gives out wrong info
+	[[ "$whois_inetnum" = "192.168.1.1/32" ]] && whois_inetnum="$found_route"
 	ixp_data=""
 	ixp_geo=""
 	ip_type_json_output=""
@@ -457,6 +461,21 @@ WhoisIP(){
 		rpki_output="-"
 	fi
 
+	found_subprefix="$found_route"
+	whois_routename=""
+	# compare cymru net with whois net and pick longer (smaller), while retaining larger for route information.
+	# we want to identify subnets to which target IPs belong, even when they aren't
+	# announced directly but within a larger route.
+	if [ "$found_route" != "N/A" ] && [ "$found_route" != "$whois_inetnum" ]; then
+		foundroute_prefixlen=$(cut -d '/' -f 2 <<<"$found_route")
+		whois_prefixlen=$(cut -d '/' -f 2 <<<"$whois_inetnum")
+		if (( whois_prefixlen > foundroute_prefixlen )) 2>/dev/null; then
+			found_subprefix="$whois_inetnum"
+			# lookup route name (RIPE)
+			whois_routename=$(timeout 5 whois "$found_route" | grep -m1 -E "^descr:" | cut -d ':' -f 2 | sed 's/^ *//g')
+		fi
+	fi
+
 	if [ "$JSON_OUTPUT" = true ]; then
 		# JSON output
 		final_json_output+="{"
@@ -465,6 +484,9 @@ WhoisIP(){
 		final_json_output+="\"ip_version\":\"$ipversion\","
 		[[ "$hostname" != "-" ]] && final_json_output+="\"reverse\":\"$hostname\","
 		final_json_output+="\"org_name\":\"$pwhois_org\","
+		# next field can be == $found_route or can be different (smaller) in case the IP belongs to a subnet (of $found_route) that's not routed directly
+		final_json_output+="\"net_range\":\"$found_subprefix\","
+		final_json_output+="\"net_name\":\"$pwhois_net\","
 		if [ -n "$abusecontacts" ] && [ "$abusecontacts" != "-" ]; then
 			final_json_output+="\"abuse_contacts\":$abusecontacts,"
 		fi
@@ -473,8 +495,8 @@ WhoisIP(){
 			final_json_output+="\"is_announced\":true,"
 			final_json_output+="\"as_number\":\"$found_asn\","
 			final_json_output+="\"as_name\":\"${found_asname//\"/\\\"}\","
-			final_json_output+="\"net_range\":\"$found_route\","
-			final_json_output+="\"net_name\":\"$pwhois_net\","
+			final_json_output+="\"route\":\"$found_route\","
+			final_json_output+="\"route_name\":\"$whois_routename\","
 			final_json_output+="\"roa_count\":\"$roacount_json_output\","
 			final_json_output+="\"roa_validity\":\"$roavalidity_json_output\""
 		else
@@ -507,7 +529,15 @@ WhoisIP(){
 		fi
 		printf "${white}%${indent}s${bluebg}ASN${default} ${red}%s %s${default}\n" "├" "$summary_asn" "$output_asname"
 		printf "${white}%${indent}s${bluebg}ORG${default} ${green}%s${default}\n" "├" "$pwhois_org"
-		printf "${white}%${indent}s${bluebg}NET${default} ${yellow}%s (%s)%s${default}\n" "├" "$found_route" "$pwhois_net" "$summary_ipinfo"
+		if [ "$found_subprefix" != "$found_route" ]; then
+			# target IP belongs to a subnet announced within a larger route
+			printf "${white}%${indent}s${bluebg}NET${default} ${yellow}%s (%s)${default}\n" "├" "$found_subprefix" "$pwhois_net"
+			[[ -n "$whois_routename" ]] && whois_routename=" ($whois_routename)"
+			printf "${white}%${indent}s${bluebg}ROU${default} ${yellow}%s%s%s${default}\n" "├" "$found_route" "$whois_routename" "$summary_ipinfo"
+		else
+			# target IP belongs to a subnet announced directly
+			printf "${white}%${indent}s${bluebg}NET${default} ${yellow}%s (%s)%s${default}\n" "├" "$found_subprefix" "$pwhois_net" "$summary_ipinfo"
+		fi
 		printf "${white}%${indent}s${bluebg}ABU${default} ${blue}%s${default}\n" "├" "$abusecontacts"
 		printf "${white}%${indent}s${bluebg}ROA${default} %s\n" "├" "$rpki_output"
 		[[ -n "$ip_type_data" ]] && printf "${white}%${indent}s${bluebg}TYP${default}%s\n" "├" "${ip_type_data}"
@@ -675,7 +705,7 @@ PrintUsage(){
 			"\n\n  ${blue}<URL>${default}\n\tExtract hostname/IP from the URL and lookup relative data. Supports any protocol prefix, non-standard ports and prepended credentials" \
 			"\n\n  ${blue}<Organization Name>${default}\n\tSearch by company name and lookup network ranges exported by (or related to) the company" \
 			"\n\nSERVER OPTIONS:" \
-			"\n\n  ${red}BIND_ADDRESS${default}\n\tIP address (v4/v6) to bind the listening server to (e.g. '$script_name -l 0.0.0.0')\n\tDefault value: ${red}${DEFAULT_SERVER_BINDADDR}${default}" \
+			"\n\n  ${red}BIND_ADDRESS${default}\n\tIP address (v4/v6) to bind the listening server to (e.g. '$script_name -l 0.0.0.0')\n\tDefault value: ${red}${DEFAULT_SERVER_BINDADDR_v4} (IPv4) or ${DEFAULT_SERVER_BINDADDR_v6} (IPv6)${default}" \
 			"\n\n  ${red}BIND_PORT${default}\n\tTCP Port to bind the listening server to (e.g. '$script_name -l 12345')\n\tDefault value: ${red}${DEFAULT_SERVER_BINDPORT}${default}" \
 			"\n\n  ${red}BIND_ADDRESS${default} ${red}BIND_PORT${default}\n\tIP address and port to bind the listening server to (e.g. '$script_name -l ::1 12345')" \
 			"\n\n  ${red}-v    (verbose)\n\t${default}Enable verbose output and debug messages in server mode${default}" \
@@ -686,10 +716,10 @@ PrintUsage(){
 			"\n\n  ${red}-m, --max-conns <n>\n\t${default}The maximum number of simultaneous connections accepted by the server. 100 is the default.${default}" \
 			"\n\n\n  Note: Every option in server mode (after -l) is passed directly to the ncat listener." \
 			"\n        Refer to ${blue}man ncat${default} for more details on the available commands." \
-			"\n        Unless specified, the default IP:PORT values of ${DEFAULT_SERVER_BINDADDR}:${DEFAULT_SERVER_BINDPORT} will be used (e.g. 'asn -l')" \
+			"\n        Unless specified, the default IP:PORT values of ${DEFAULT_SERVER_BINDADDR_v4}:${DEFAULT_SERVER_BINDPORT} (for IPv4) or [${DEFAULT_SERVER_BINDADDR_v6}]:${DEFAULT_SERVER_BINDPORT} (for IPv6) will be used (e.g. 'asn -l')" \
 			"\n\n  Example server usage:" \
 			"\n\t${blue}asn -l${default}" \
-			"\n\t  (starts server on default IP:PORT)\n" \
+			"\n\t  (starts server on default IP(v4/v6):PORT)\n" \
 			"\n\t${blue}asn -l 0.0.0.0 --allow 192.168.0.0/24,192.168.1.0/24,192.168.2.245${default}" \
 			"\n\t  (binds to all availables IPv4 interfaces on the default port, allowing only connections from the three specified subnets)\n" \
 			"\n\t${blue}asn -l :: 2222 --allow 2001:DB8::/32${default}" \
@@ -851,8 +881,12 @@ TraceASPath(){
 	declare -a tracehops_array
 	declare -a aspath_array
 	# initialize the aspath array with our source AS
-	# TODO: improve local WAN IPv6 ASN lookup (Cymru and pWhois sometimes fail to correctly retrieve matching prefix. Consider RIPEstat/direct whois?)
-	LookupASNAndRouteFromIP "$local_wanip"
+	if [ "$HAVE_IPV6" = true ]; then
+		found_asn=$(docurl -s "https://stat.ripe.net/data/whois/data.json?resource=$local_wanip&sourceapp=nitefood-asn" | jq -r '.data.irr_records[0] | map(select(.key | match ("origin"))) | .[].value')
+		WhoisASN "$found_asn"
+	else
+		LookupASNAndRouteFromIP "$local_wanip"
+	fi
 	if [ -z "$found_asn" ]; then
 		found_asn="XXX"
 		found_asname="(Unknown)"
@@ -2033,8 +2067,16 @@ IsIXP() {
 			# if input is an IPv4, speedup lookups further by grabbing only IXP prefixes starting with the same two octets
 			# we can afford filtering based on the first two octets since the largest individual IXP prefix is around /20
 			first_octets=$(echo "${1}." | cut -d '.' -f 1,2)
-			peeringdb_ipv4_dataset=$(docurl -s "https://www.peeringdb.com/api/ixpfx?prefix__startswith=$first_octets&protocol__in=IPv4")
-			peeringdb_dataset="$peeringdb_ipv4_dataset"
+			# see if the PEERINGDB_CACHED_DATASETS array already an entry for this prefix's first two octets.
+			# If not, fetch the relevant IXP prefix dataset from PeeringDB and store it in the PEERINGDB_CACHED_DATASETS
+			if [ -n "${PEERINGDB_CACHED_DATASETS[$first_octets]}" ]; then
+				peeringdb_dataset="${PEERINGDB_CACHED_DATASETS[$first_octets]}"
+			else
+				peeringdb_ipv4_dataset=$(docurl -s "https://www.peeringdb.com/api/ixpfx?prefix__startswith=$first_octets&protocol__in=IPv4")
+				peeringdb_dataset="$peeringdb_ipv4_dataset"
+				# store the IXP dataset in the PEERINGDB_CACHED_DATASETS array
+				PEERINGDB_CACHED_DATASETS[$first_octets]="$peeringdb_dataset"
+			fi
 		else
 			# only fetch IPv6 dataset once, since we don't filter it for prefixes
 			if [ -z "$peeringdb_ipv6_dataset" ]; then
@@ -2047,9 +2089,17 @@ IsIXP() {
 		for prefix in $ixp_prefixes; do
 			if echo "$1" | grepcidr -f <(echo "$prefix") &>/dev/null; then
 				# the IP is part of an IXP prefix
-				# Query PeeringDB to match an IXP for that prefix.
 				ixlan_id=$(jq -r '.data[] | select(.prefix == "'"$prefix"'") | .ixlan_id' <<<"$peeringdb_dataset")
-				ixp_full_ix_data=$(docurl -s "https://www.peeringdb.com/api/ix/$ixlan_id")
+				# see if the PEERINGDB_CACHED_IXP_DATA array already has an entry with the IXP details for this ixlan_id.
+				# If not, fetch the full IXP data from PeeringDB and store it in the PEERINGDB_CACHED_IXP_DATA
+				if [ -n "${PEERINGDB_CACHED_IXP_DATA[$ixlan_id]}" ]; then
+					ixp_full_ix_data="${PEERINGDB_CACHED_IXP_DATA[$ixlan_id]}"
+				else
+					# Query PeeringDB to match an IXP for that prefix.
+					ixp_full_ix_data=$(docurl -s "https://www.peeringdb.com/api/ix/$ixlan_id")
+					# store the IXP data in the PEERINGDB_CACHED_IXP_DATA array
+					PEERINGDB_CACHED_IXP_DATA[$ixlan_id]="$ixp_full_ix_data"
+				fi
 				ixp_data=$(jq -r '.data[0].name, .data[0].name_long' <<<"$ixp_full_ix_data" | paste -sd '|' - | awk -F'|' '{print $1 " (" $2 ")"}')
 				ixp_geo=$(jq -r '.data[0].org.city' <<<"$ixp_full_ix_data")
 				ixp_state=$(jq -r '.data[0].org.state' <<<"$ixp_full_ix_data")
@@ -2215,7 +2265,7 @@ IPGeoRepLookup(){
 		ip_type_json_output+=",\"is_proxy\":false"
 	fi
 	# fetch detailed DC informations (incolumitas.com Datacenter IP Address API)
-	incolumitas_dcdata=$(docurl -m2 -s https://api.incolumitas.com/datacenter?ip=$1)
+	incolumitas_dcdata=$(docurl -m2 -s "https://api.incolumitas.com/datacenter?ip=$1")
 	dcname=$(jq -r 'select (.datacenter.datacenter != null) | .datacenter.datacenter' <<<"$incolumitas_dcdata" 2>/dev/null)
 	dcregion=$(jq -r 'select (.datacenter.region != null) | .datacenter.region' <<<"$incolumitas_dcdata" 2>/dev/null)
 	if [ -n "$dcname" ]; then
@@ -2243,11 +2293,16 @@ IPGeoRepLookup(){
 	json_iqs_threat_tags=""
 	is_blacklisted=$(docurl -m4 -s "http://api.stopforumspam.org/api?json&ip=$1" | jq -r '.ip.appears')
 	if [ "$is_blacklisted" = "1" ]; then
+		# IP is blacklisted by StopForumSpam
 		json_rep="bad"
-		# IP is blacklisted by StopForumSpam. Lookup detailed reputation data on IPQualityScore
 		ip_rep_data="${red}❌ BAD (on stopforumspam.org)${default}"
-		if [ -n "$IQS_TOKEN" ]; then
-			iqs_output=$(docurl -m4 -s "https://ipqualityscore.com/api/json/ip/$IQS_TOKEN/$1")
+	fi
+	if [ -n "$IQS_TOKEN" ]; then
+		if [ "$is_blacklisted" = "1" ] || [ "$IQS_ALWAYS_QUERY" = true ]; then
+			# Lookup detailed reputation data on IPQualityScore
+			iqs_query_url="https://ipqualityscore.com/api/json/ip/$IQS_TOKEN/$1"
+			[[ -n "$IQS_CUSTOM_SETTINGS" ]] && iqs_query_url+="?$IQS_CUSTOM_SETTINGS"
+			iqs_output=$(docurl -m4 -s "$iqs_query_url")
 			iqs_success=$(jq -r '.success' <<<"$iqs_output")
 			if [ "$iqs_success" = true ]; then
 				iqs_score=$(jq -r '.fraud_score' <<<"$iqs_output")
@@ -2425,17 +2480,24 @@ AsnServerListener(){
 	BoxHeader "ASN Lookup Server v$ASN_VERSION on $HOSTNAME"
 
 	if [ "$ASN_DEBUG" = true ]; then
-		echo -en "\n- ${yellow}[DBG]${default} Server BIND_ADDR : $ASN_SRV_BINDADDR"
-		[[ "$ASN_SRV_BINDADDR" = "$DEFAULT_SERVER_BINDADDR" ]] && echo -en "\t${green}(default)${default}"
+		echo -en "\n- ${yellow}[DBG]${default} Server BIND_ADDR :"
+		[[ -z "$ASN_SRV_BINDADDR" ]] && echo -en " ${green}(default v4/v6)${default}" || echo -en " $ASN_SRV_BINDADDR"
 		echo -en "\n- ${yellow}[DBG]${default} Server BIND_PORT : $ASN_SRV_BINDPORT"
-		[[ "$ASN_SRV_BINDPORT" = "$DEFAULT_SERVER_BINDPORT" ]] && echo -en "\t${green}(default)${default}"
+		[[ "$ASN_SRV_BINDPORT" = "$DEFAULT_SERVER_BINDPORT" ]] && echo -en " ${green}(default)${default}"
 		echo -e "\n- ${yellow}[DBG]${default} Ncat options     : '${blue}${userinput}${default}'" >&2
 	fi
 
 	# fetch external IP and ASN to include in the HTML reports
 	StatusbarMessage "Detecting host external IP and ASN"
 	WhatIsMyIP
-	LookupASNAndRouteFromIP "$local_wanip"
+	if [ "$HAVE_IPV6" = true ]; then
+		found_asn=$(docurl -s "https://stat.ripe.net/data/whois/data.json?resource=$local_wanip&sourceapp=nitefood-asn" | jq -r '.data.irr_records[0] | map(select(.key | match ("origin"))) | .[].value')
+		WhoisASN "$found_asn"
+		[[ -z "$ASN_SRV_BINDADDR" ]] && ASN_SRV_BINDADDR="$DEFAULT_SERVER_BINDADDR_v6"
+	else
+		LookupASNAndRouteFromIP "$local_wanip"
+		[[ -z "$ASN_SRV_BINDADDR" ]] && ASN_SRV_BINDADDR="$DEFAULT_SERVER_BINDADDR_v4"
+	fi
 	if [ -z "$found_asn" ]; then
 		found_asn="N/A"
 		found_asname="(Unknown)"
@@ -2450,11 +2512,17 @@ AsnServerListener(){
 	else
 		[[ "$IS_HEADLESS" = true ]] && ipv6_mark="NO" || ipv6_mark="${red}❌ NO${default}"
 	fi
+	# properly show [IP]:PORT notation in case of IPv6 binding
+	if grep -q ':' <<<"$ASN_SRV_BINDADDR"; then
+		DISPLAY_ASN_SRV_BINDADDR="[${ASN_SRV_BINDADDR}]"
+	else
+		DISPLAY_ASN_SRV_BINDADDR="${ASN_SRV_BINDADDR}"
+	fi
 	echo -e "\n- Server ext. IP  : ${blue}${local_wanip}${default}" \
 			"\n- Server Country  : ${blue}${server_country}${default}" \
 			"\n- Server ASN      : ${red}[AS${found_asn}]${default} ${green}$found_asname${default}" \
 			"\n- Server has IPv6 : $ipv6_mark" \
-			"\n\n[$(date +"%F %T")] ${bluebg}  INFO   ${default} ASN Lookup Server listening on ${ASN_SRV_BINDADDR}:${ASN_SRV_BINDPORT}"
+			"\n\n[$(date +"%F %T")] ${bluebg}  INFO   ${default} ASN Lookup Server listening on ${white}${DISPLAY_ASN_SRV_BINDADDR}:${ASN_SRV_BINDPORT}${default}"
 
 	server_country="$(echo -e "$server_country" | tr '[:upper:]' '[:lower:]')"
 
@@ -2548,8 +2616,8 @@ StatusbarMessage() { # invoke without parameters to delete the status bar messag
 WhatIsMyIP() {
 	# only lookup local WAN IP once
 	[[ -n "$local_wanip" ]] && return
-	# retrieve local WAN IP (v6 takes precedence) from ipify
-	local_wanip=$(docurl -s "api64.ipify.org")
+	# retrieve local WAN IP (v6 takes precedence) from ifconfig.co
+	local_wanip=$(docurl -s "https://ifconfig.co")
 	# check if we default to an IPv6 internet connection
 	if echo "$local_wanip" | grep -q ':'; then
 		HAVE_IPV6=true
@@ -2632,25 +2700,29 @@ IpcalcVersionCheck() {
 		case "${ipcalc_major}" in
 			"0")
 				ipcalc_minor=$(echo "$ipcalc_version" | cut -d '.' -f 2)
-				if [ "$ipcalc_minor" -ge 41 ]; then
+				if [ "$ipcalc_minor" -ge 5 ]; then
 					IPCALC_FLAG="-r"
 				else
 					HAVE_IPCALC=false
 					missing_tools+="\n - ipcalc"
-					disabled_features+="\n - CIDR deaggregation (due to incompatible ipcalc version - v0.41+ for Debian-based or v1.0.0+ for RHEL-based required, but you have v$ipcalc_version)"
+					disabled_features+="\n - CIDR deaggregation (due to incompatible ipcalc version - v0.5+ for Debian-based or v1.0.0+ for RHEL-based required, but you have v$ipcalc_version)"
 				fi
 				;;
 			"1")
 				IPCALC_FLAG="-d"
 				;;
 		esac
-
 	fi
 }
 
 IpcalcDeaggregate() {
 	ipcalc_parm=$(tr -d ' ' <<<"$1")
-	ipcalc ${IPCALC_FLAG} "$ipcalc_parm" 2>/dev/null | grep -iv "deaggregate" | awk '{print $NF}' | tail -n1
+	if grep -q "/" <<<"$1"; then
+		# consider input to be already a CIDR block, return it unchanged
+		echo "$1"
+	else
+		ipcalc ${IPCALC_FLAG} "$ipcalc_parm" 2>/dev/null | grep -iv "deaggregate" | awk '{print $NF}' | tail -n1
+	fi
 }
 
 CheckPrerequisites() {
@@ -3461,8 +3533,13 @@ MONOCHROME_MODE=false
 ASN_DEBUG=false
 JSON_OUTPUT=false
 JSON_PRETTY=false
-DEFAULT_SERVER_BINDADDR="127.0.0.1"
+DEFAULT_SERVER_BINDADDR_v4="127.0.0.1"
+DEFAULT_SERVER_BINDADDR_v6="::1"
 DEFAULT_SERVER_BINDPORT="49200"
+IQS_ALWAYS_QUERY=false
+IQS_CUSTOM_SETTINGS="" # e.g. "strictness=1&allow_public_access_points=false" - see https://www.ipqualityscore.com/documentation/proxy-detection/overview -> "Note About Front End IP Lookups"
+declare -A PEERINGDB_CACHED_DATASETS
+declare -A PEERINGDB_CACHED_IXP_DATA
 
 #*
 #* Parse command line options
@@ -3619,9 +3696,8 @@ while getopts "$optspec" optchar; do {
 					ASN_SRV_BINDPORT="$passedarg"
 				fi
 			done
-			# fallback to default ports if none was passed.
+			# fallback to default port if none was passed.
 			# The rest is already in $userinput, ncat will use it for its own args
-			[[ -z "$ASN_SRV_BINDADDR" ]] && ASN_SRV_BINDADDR="$DEFAULT_SERVER_BINDADDR"
 			[[ -z "$ASN_SRV_BINDPORT" ]] && ASN_SRV_BINDPORT="$DEFAULT_SERVER_BINDPORT"
 			# trim the leading whitespace from ncat options
 			userinput="${userinput#' '}"
